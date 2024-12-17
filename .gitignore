@@ -1,0 +1,21 @@
+# project related files
+*.csv
+*.png
+*.txt
+!requirements.txt
+rough*
+*.sh
+slurm*
+log/
+
+# https://github.com/github/gitignore/blob/main/Python.gitignore
+# packaging
+__pycache__
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# sphinx documentation
+docs/_build/*
+!docs/images/*
