@@ -1,6 +1,5 @@
 from typing import Callable, Any, Tuple
 import functools
-import operator
 
 import jax
 import jax.numpy as jnp
@@ -40,7 +39,7 @@ def newton_method(f : Callable, z_guess : jnp.ndarray) -> jnp.ndarray :
     # Every linear solve uses explicit hessian 
 
     # function is only reverse mode autodiff compatible
-    grad_f = jax.jacrev(f)
+    grad_f = jax.jacfwd(f)
     
     def body_fun(val):
         dval = jnp.linalg.solve(grad_f(val), f(val))
@@ -60,13 +59,13 @@ def newton_method_inverse(f : Callable, z_guess : jnp.ndarray) -> Tuple[jnp.ndar
     # Solves root finding problem : f(z) = 0 using newtons method 
     # SVD decomposition of the Hessian is calculated and returned for reuse in reverse-mode autodiff
 
-    grad_f = jax.jacrev(f)
-    inverse = jnp.linalg.svd(grad_f(z_guess))    
+    grad_f = jax.jacfwd(f)
+    inverse = jnp.linalg.svd(grad_f(z_guess), full_matrices = False)    
 
     def body_fun(val):
         val, (u, s, vh) = val
         new_val = val - vh.T @ ((u.T @ f(val)) / s)
-        inverse = jnp.linalg.svd(grad_f(new_val))
+        inverse = jnp.linalg.svd(grad_f(new_val), full_matrices = False)
         return new_val, inverse
     
     def cond_fun(val):
@@ -123,7 +122,6 @@ def _root_finding_reuse_bwd(solver, f, res, gdot):
 
 _root_finding_reuse.defvjp(_root_finding_reuse_fwd, _root_finding_reuse_bwd)
 
-
 def root_finding_rev(f : Callable, z : Pytree, p : Pytree, reuse_inverse : bool = False) -> Pytree : 
     # Reverse mode autodiff compatible root finding problem 
 
@@ -139,6 +137,7 @@ def _root_finding_fwd(solver : Callable, f : Callable, z : jnp.ndarray, p : Pytr
     # Forward mode auto diff compatible root finding problem with f : Rn -> Rn
     return solver(lambda z : f(z, p), z)
 
+@_root_finding_fwd.defjvp
 def _root_finding_fwd_fwd(solver, f, primals, tangents):
     z, p = primals
     zdot, pdot = tangents
@@ -147,23 +146,20 @@ def _root_finding_fwd_fwd(solver, f, primals, tangents):
     tangents_out = solver(lambda v : jax.jvp(lambda z, p : f(z, p), (zstar, p), (v, pdot))[-1], jnp.zeros_like(zdot))
     return zstar, tangents_out
 
-_root_finding_fwd.defjvp(_root_finding_fwd_fwd)
-
 
 @functools.partial(jax.custom_jvp, nondiff_argnums = (0, 1))
 def _root_finding_fwd_reuse(solver : Callable, f : Callable, z : jnp.ndarray, p : Pytree) -> Pytree :
     # Forward mode auto diff compatible root finding problem with f : Rn -> Rn
     return solver(lambda z : f(z, p), z)
 
+@_root_finding_fwd_reuse.defjvp
 def _root_finding_fwd_reuse_fwd(solver, f, primals, tangents):
     z, p = primals
-    zdot, pdot = tangents
+    _, pdot = tangents
     
     solution = zstar, (u, s, vh) = _root_finding_fwd_reuse(solver, f, z, p)
-    tangents_out = vh.T @ ((u.T @ jax.jvp(lambda p : f(zstar, p), (p, ), (pdot, ))[-1]) / s)
+    tangents_out = - vh.T @ ((u.T @ jax.jvp(lambda p : f(zstar, p), (p, ), (pdot, ))[-1]) / s)
     return solution, (tangents_out, tree_util.tree_map(jnp.zeros_like, (u, s, vh)))
-
-_root_finding_fwd_reuse.defjvp(_root_finding_fwd_reuse_fwd)
 
 
 def root_finding_fwd(f : Callable, z : Pytree, p : Pytree, reuse_inverse : bool = False) -> Pytree : 
@@ -175,8 +171,4 @@ def root_finding_fwd(f : Callable, z : Pytree, p : Pytree, reuse_inverse : bool 
     
     z_opt = _root_finding_fwd_reuse(newton_method_inverse, _f, z_flat, p)[0] if reuse_inverse else _root_finding_fwd(newton_method, _f, z_flat, p)
     return unravel(z_opt)
-
-
-
-
 
