@@ -1,13 +1,20 @@
 from functools import partial
+import operator
 
 import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_debug_nans", True)
+from jax.interpreters import ad
+from jax._src.ad_util import stop_gradient_p
 from jax import tree_util, flatten_util
 import diffrax
 
 from utils import flatten_output
+
+
+# https://github.com/jax-ml/jax/issues/10994
+ad.primitive_transposes[stop_gradient_p] = lambda ct, _ : [tree_util.tree_map(jnp.zeros_like, ct)]
 
 
 def odeint_diffrax(afunc, rtol, atol, mxstep, xinit, time_span, parameters):
@@ -175,7 +182,7 @@ def _custom_odeint_event(afunc, event, xinit, time_span, parameters, rtol, atol,
             next_t = t + dt
             error_ratios = mean_error_ratio(next_y_error, rtol, atol, y, next_y)
             new_interp_coeff = interp_fit_dopri(y, next_y, k, dt)
-            dt = jnp.clip(jax.lax.stop_gradient(optimal_step_size(dt, error_ratios)), a_min = 0., a_max = jnp.inf)
+            dt = jnp.clip(optimal_step_size(dt, error_ratios), a_min = 0., a_max = jnp.inf)
             next_events = _event_cond(next_y, next_t)
 
             new = [i + 1, next_y, next_f, next_t, dt,      t, new_interp_coeff, event_times, next_events]
@@ -244,6 +251,16 @@ def _custom_odeint_event(afunc, event, xinit, time_span, parameters, rtol, atol,
     
     return carry[-2] # return event_times
 
+@partial(jax.custom_jvp, nondiff_argnums = (0, 1, 5, 6, 7))
+def custom_odeint_event(afunc, event, xinit, time_span, parameters, rtol, atol, mxstep = None):
+    return jax.lax.stop_gradient(_custom_odeint_event(afunc, event, xinit, time_span, parameters, rtol, atol, mxstep))
+
+@custom_odeint_event.defjvp
+def custom_odeint_event_fwd(afunc, event, rtol, atol, mxstep, primals, tangents):
+    xinit, time_span, parameters = primals
+    event_times = custom_odeint_event(afunc, event, xinit, time_span, parameters, rtol, atol, mxstep)
+    return event_times, jnp.zeros_like(event_times)
+
 
 @partial(jax.custom_vjp, nondiff_argnums = (0, 1))
 def _implicit_rev(afunc, event, x, t, p):
@@ -283,6 +300,40 @@ def _implicit_rev_bwd(afunc, event, res, gdot):
 _implicit_rev.defvjp(_implicit_rev_fwd, _implicit_rev_bwd)
 
 
+@partial(jax.custom_jvp, nondiff_argnums = (0, 1))
+def _implicit_fwd(afunc, event, x, t, p):
+    # Transfer function for hybrid dynamical equations. Custom vjp rules define the 
+    # transfer sensitivities as given in https://ieeexplore.ieee.org/document/7831410 and https://frankschae.github.io/post/bouncing_ball/
+    # afunc : vmapped function 
+    # event : single trajectory function
+    return x 
+
+@_implicit_fwd.defjvp
+def _implicit_fwd_bwd(afunc, event, primals, tangents):
+    
+    x, t, (event_times, p) = primals
+    x_dot, *_ = tangents
+    _event = lambda x, t : event(x, t)[0]
+
+    def _transfer_sensitivity(xconstant, xfalling, _x_dot):
+        de_dx = jax.jacrev(_event, argnums = 0)(xconstant, t)
+        dg_dt = jnp.vdot(xconstant, de_dx)
+        _v = jnp.vdot(_x_dot, de_dx) / dg_dt
+        return _x_dot + _v * (xfalling - xconstant)
+
+    xfalling = afunc(x, t + 1e-10, (event_times, p))
+    xconstant = afunc(x, t, (event_times, p))
+    
+    # vmap over event_times
+    lam = jax.vmap(lambda _event_time, *args : jax.lax.cond(
+        t == _event_time, 
+        lambda : _transfer_sensitivity(*args),
+        lambda : args[-1], # do nothing
+        ))(event_times, xconstant, xfalling, x_dot)
+    
+    return x, lam
+
+
 @partial(jax.jit, static_argnums = (0, 1, 2, 6, 7, 8))
 def odeint_event(afunc, event, transfer, xinit, time_span, p, rtol = 1.4e-8, atol = 1.4e-8, mxstep = 10_000):
     # vmapped function : afunc lambda x, t, p : 
@@ -290,15 +341,13 @@ def odeint_event(afunc, event, transfer, xinit, time_span, p, rtol = 1.4e-8, ato
     # vmapped transfer function : lambda transfer_function, x, t, p : 
 
     # Flatten the input and the outputs of the function
-    # event_times = jnp.ones_like(xinit[:, 0]) * (time_span[-1] + 1)
     
     flatten_xinit, unravel_x = flatten_util.ravel_pytree(xinit)
     afunc = flatten_output(afunc, unravel_x)
     event = flatten_output(event, unravel_x)
-    _transfer = flatten_output(lambda x, t, args : transfer(_implicit_rev, x, t, args), unravel_x)
+    _transfer = flatten_output(lambda x, t, args : transfer(_implicit_fwd, x, t, args), unravel_x)
 
-    event_times = jax.lax.stop_gradient(_custom_odeint_event(afunc, event, flatten_xinit, time_span, p, rtol, atol, mxstep))
-    # jax.debug.print("event times : {}", event_times)
+    event_times = custom_odeint_event(afunc, event, flatten_xinit, time_span, p, rtol, atol, mxstep)
 
     def scan_fun(carry, loop_vars):
         event_start, event_end = loop_vars
