@@ -123,7 +123,9 @@ def _root_finding_reuse_bwd(solver, f, res, gdot):
 _root_finding_reuse.defvjp(_root_finding_reuse_fwd, _root_finding_reuse_bwd)
 
 def root_finding_rev(f : Callable, z : Pytree, p : Pytree, reuse_inverse : bool = False) -> Pytree : 
-    # Reverse mode autodiff compatible root finding problem 
+    # Reverse-mode autodiff compatible root finding problem. 
+    # Note that reusing inverse incorrectly predicts higher order derivatives (> 1). 
+    # Use reuse_inverse = False for computing higher oder derivatives
 
     z_flat, unravel = flatten_util.ravel_pytree(z)
     _f = flatten_output(f, unravel_first_arg = unravel)
@@ -143,7 +145,8 @@ def _root_finding_fwd_fwd(solver, f, primals, tangents):
     zdot, pdot = tangents
     
     zstar = _root_finding_fwd(solver, f, z, p)
-    tangents_out = solver(lambda v : jax.jvp(lambda z, p : f(z, p), (zstar, p), (v, pdot))[-1], jnp.zeros_like(zdot))
+    # tangents_out = solver(lambda v : jax.jvp(lambda z, p : f(z, p), (zstar, p), (v, pdot))[-1], jnp.zeros_like(zdot))
+    tangents_out = jnp.linalg.solve(jax.jacfwd(f)(zstar, p), - jax.jvp(lambda p : f(zstar, p), (p, ), (pdot, ))[-1])
     return zstar, tangents_out
 
 
@@ -163,8 +166,9 @@ def _root_finding_fwd_reuse_fwd(solver, f, primals, tangents):
 
 
 def root_finding_fwd(f : Callable, z : Pytree, p : Pytree, reuse_inverse : bool = False) -> Pytree : 
-    # Forward mode autodiff compatible root finding problem. 
-    # The gradients in newtons method are still calculated using reverse mode autodiff
+    # Forward- and reverse-mode autodiff compatible root finding problem. 
+    # Note that reusing inverse incorrectly predicts higher order derivatives (> 1).
+    # Use reuse_inverse = False for computing higher oder derivatives
 
     z_flat, unravel = flatten_util.ravel_pytree(z)
     _f = flatten_output(f, unravel_first_arg = unravel)
