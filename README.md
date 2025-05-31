@@ -15,7 +15,7 @@ This project is based on our paper (https://www.sciencedirect.com/science/articl
 Clone the repository:
 
 ```
-git clone [https://github.com/yourusername/your-repo-name.git](https://github.com/siddharth-prabhu/EventODE.git)
+git clone https://github.com/siddharth-prabhu/EventODE.git
 cd EventODE
 python main.py
 ```
